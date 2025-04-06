@@ -15,6 +15,23 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# Hỏi tên cho cấu hình ngay từ đầu
+while true; do
+  read -p "Nhập tên cho cấu hình (không được để trống, mặc định: myss): " config_name
+  config_name=${config_name:-myss}
+  
+  # Loại bỏ khoảng trắng và ký tự đặc biệt để tránh lỗi URI
+  config_name=$(echo "$config_name" | tr -cd '[:alnum:]-_')
+  
+  if [ -n "$config_name" ]; then
+    break
+  else
+    echo -e "${RED}Tên cấu hình không được để trống!${NC}"
+  fi
+done
+
+echo -e "${GREEN}Đã đặt tên cấu hình: ${config_name}${NC}"
+
 # Function để ghi log
 log() {
   local type=$1
@@ -83,22 +100,7 @@ fi
 
 log "success" "Địa chỉ IP của server: ${server_ip}"
 
-# Hỏi tên cho cấu hình và đảm bảo luôn có giá trị
-while true; do
-  read -p "Nhập tên cho cấu hình (không được để trống, mặc định: myss): " config_name
-  config_name=${config_name:-myss}
-  
-  # Loại bỏ khoảng trắng và ký tự đặc biệt để tránh lỗi URI
-  config_name=$(echo "$config_name" | tr -cd '[:alnum:]-_')
-  
-  if [ -n "$config_name" ]; then
-    break
-  else
-    log "error" "Tên cấu hình không được để trống!"
-  fi
-done
-
-log "success" "Tên cấu hình: ${config_name}"
+# Đã di chuyển phần nhập tên lên đầu script
 
 # Cấu hình shadowsocks-libev với các tham số tối ưu
 log "info" "Đang cấu hình Shadowsocks..."
@@ -353,8 +355,13 @@ log "success" "==================================="
 echo -e "${YELLOW}Shadowsocks Link:${NC} ${ss_link}"
 log "success" "==================================="
 echo -e "${YELLOW}Shadowsocks QR Code:${NC}"
-echo -n "${ss_link}" | qrencode -t UTF8
-log "success" "==================================="
+
+# Tạo QR code với tên cấu hình thay vì [SUCCESS]
+custom_qr=$(echo -n "${ss_link}" | qrencode -t UTF8)
+echo -e "$custom_qr" | sed "s/\[SUCCESS\]/${GREEN}[${config_name}]${NC}/g"
+
+# Hiển thị dòng phân cách có tên người dùng thay vì SUCCESS
+echo -e "${GREEN}==== ${config_name} =============================${NC}"
 
 # Kiểm tra kết nối
 log "info" "Đang kiểm tra kết nối..."
