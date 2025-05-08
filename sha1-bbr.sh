@@ -1,6 +1,6 @@
 #!/bin/bash
-# Script tự động cài đặt Shadowsocks với URI định dạng chính xác và hiệu suất tối ưu
-# Sử dụng: chmod +x optimized_ss_installer.sh && sudo ./optimized_ss_installer.sh
+# Script tự động cài đặt Shadowsocks với port 443 (HTTPS) để ẩn danh tốt hơn
+# Sử dụng: chmod +x optimized_ss_installer_443.sh && sudo ./optimized_ss_installer_443.sh
 
 # Màu sắc
 RED='\033[0;31m'
@@ -57,11 +57,47 @@ apt-get update -y
 
 # Cài đặt các gói cần thiết
 log "info" "Đang cài đặt các gói cần thiết..."
-apt-get install -y curl wget jq qrencode unzip iptables shadowsocks-libev monit
+apt-get install -y curl wget jq qrencode unzip iptables shadowsocks-libev monit lsof
 
-# Tạo port ngẫu nhiên (10000-60000) - tránh port thông dụng
-server_port=$(shuf -i 10000-60000 -n 1)
-log "success" "Đã tạo port ngẫu nhiên: ${server_port}"
+# Sử dụng port 443 (HTTPS) để ẩn danh tốt hơn
+server_port=443
+
+# Kiểm tra xem port 443 đã được sử dụng chưa
+if lsof -i :443 > /dev/null 2>&1; then
+    log "warning" "Port 443 đã được sử dụng bởi một dịch vụ khác. Kiểm tra xem có phải là web server không..."
+    
+    # Kiểm tra nếu là Nginx/Apache đang chạy
+    if systemctl is-active --quiet nginx || systemctl is-active --quiet apache2; then
+        log "error" "Máy chủ web (Nginx/Apache) đang chạy trên port 443. Vui lòng dừng hoặc cấu hình lại trước khi tiếp tục."
+        read -p "Bạn muốn tiếp tục với port ngẫu nhiên khác? (y/n): " choose_random_port
+        if [[ "$choose_random_port" == "y" || "$choose_random_port" == "Y" ]]; then
+            server_port=$(shuf -i 10000-60000 -n 1)
+            log "info" "Đã chọn port ngẫu nhiên: ${server_port}"
+        else
+            exit 1
+        fi
+    else
+        read -p "Port 443 đã được sử dụng. Bạn muốn dừng dịch vụ đang sử dụng và tiếp tục? (y/n): " stop_service
+        if [[ "$stop_service" == "y" || "$stop_service" == "Y" ]]; then
+            log "info" "Đang cố gắng giải phóng port 443..."
+            fuser -k 443/tcp
+            sleep 2
+            if lsof -i :443 > /dev/null 2>&1; then
+                log "error" "Không thể giải phóng port 443. Sử dụng port ngẫu nhiên..."
+                server_port=$(shuf -i 10000-60000 -n 1)
+            else
+                log "success" "Đã giải phóng port 443 thành công."
+            fi
+        else
+            server_port=$(shuf -i 10000-60000 -n 1)
+            log "info" "Đã chọn port ngẫu nhiên: ${server_port}"
+        fi
+    fi
+else
+    log "success" "Port 443 khả dụng và sẽ được sử dụng cho Shadowsocks."
+fi
+
+log "success" "Đã cấu hình port: ${server_port}" 
 
 # Tạo mật khẩu ngẫu nhiên mạnh (16 ký tự với cả chữ, số, ký tự đặc biệt)
 password=$(tr -dc 'A-Za-z0-9!@#$%^&*()_+' </dev/urandom | head -c 16)
@@ -100,10 +136,33 @@ fi
 
 log "success" "Địa chỉ IP của server: ${server_ip}"
 
-# Đã di chuyển phần nhập tên lên đầu script
+# Cấu hình shadowsocks-libev với các tham số tối ưu và thêm plugin obfs để ẩn danh tốt hơn
+log "info" "Đang cài đặt plugin obfs để ẩn danh tốt hơn..."
+apt-get install -y --no-install-recommends build-essential autoconf libtool libssl-dev libpcre3-dev libev-dev asciidoc xmlto automake
 
-# Cấu hình shadowsocks-libev với các tham số tối ưu
-log "info" "Đang cấu hình Shadowsocks..."
+# Cài đặt simple-obfs để ngụy trang lưu lượng thành HTTPS
+if [ ! -f "/usr/local/bin/obfs-server" ]; then
+  log "info" "Đang cài đặt simple-obfs..."
+  
+  # Clone repository
+  git clone https://github.com/shadowsocks/simple-obfs.git
+  cd simple-obfs
+  git submodule update --init --recursive
+  
+  # Biên dịch và cài đặt
+  ./autogen.sh
+  ./configure && make
+  make install
+  
+  cd ..
+  rm -rf simple-obfs
+  
+  log "success" "Đã cài đặt simple-obfs thành công."
+else
+  log "success" "simple-obfs đã được cài đặt."
+fi
+
+log "info" "Đang cấu hình Shadowsocks với plugin obfs..."
 cat > /etc/shadowsocks-libev/config.json << EOF
 {
     "server":"0.0.0.0",
@@ -115,7 +174,9 @@ cat > /etc/shadowsocks-libev/config.json << EOF
     "no_delay":true,
     "reuse_port":true,
     "nameserver":"8.8.8.8,1.1.1.1",
-    "mode":"tcp_and_udp"
+    "mode":"tcp_and_udp",
+    "plugin":"obfs-server",
+    "plugin_opts":"obfs=tls"
 }
 EOF
 
@@ -154,7 +215,7 @@ else
     log "info" "Đang cấu hình ss-server trực tiếp..."
     cat > /etc/systemd/system/ss-server.service << EOF
 [Unit]
-Description=Shadowsocks Server
+Description=Shadowsocks Server with obfs
 After=network.target
 
 [Service]
@@ -325,20 +386,30 @@ chmod +x /usr/local/bin/check_shadowsocks.sh
 log "success" "Đã tạo script kiểm tra và cronjob để giám sát Shadowsocks mỗi 5 phút!"
 
 # Tạo URI đúng định dạng (ĐẢM BẢO CÓ TÊN)
+# Tạo một phiên bản URI với plugin obfs
+# Cấu hình plugin cho client
+plugin_opts="obfs=tls;obfs-host=www.google.com"
+
 # Chuỗi để mã hóa: method:password
 auth_string="${method}:${password}"
 # Mã hóa base64 (không xuống dòng)
 auth_base64=$(echo -n "${auth_string}" | base64 -w 0)
-# Tạo URI Shadowsocks theo đúng định dạng
+
+# Tạo URI Shadowsocks với plugin obfs
+ss_link_obfs="ss://${auth_base64}@${server_ip}:${server_port}/?plugin=obfs-local%3Bobfs%3Dtls%3Bobfs-host%3Dwww.google.com"
+
+# Tạo URI Shadowsocks thông thường (không có plugin) cho các máy khách không hỗ trợ plugin
 ss_link="ss://${auth_base64}@${server_ip}:${server_port}"
 
 # ĐẢM BẢO có phần tên trong URI
 if [ -n "$config_name" ]; then
   ss_link="${ss_link}#${config_name}"
+  ss_link_obfs="${ss_link_obfs}#${config_name}-obfs"
 else
   # Nếu không có tên, tạo tên mặc định từ thông tin server
   config_name="SS-${server_ip}-$(date +%Y%m%d)"
   ss_link="${ss_link}#${config_name}"
+  ss_link_obfs="${ss_link_obfs}#${config_name}-obfs"
 fi
 
 # In thông tin
@@ -347,18 +418,24 @@ log "success" "Cài đặt, tối ưu và giám sát hoàn tất!"
 log "success" "==================================="
 echo -e "${YELLOW}Thông tin kết nối Shadowsocks:${NC}"
 echo -e "Server IP: ${server_ip}"
-echo -e "Server Port: ${server_port}"
+echo -e "Server Port: ${server_port} ${GREEN}(Port HTTPS chuẩn để ẩn danh tốt hơn)${NC}"
 echo -e "Password: ${password}"
 echo -e "Method: ${method}"
 echo -e "Tên cấu hình: ${config_name}"
+echo -e "Plugin: obfs-local với obfs=tls"
 log "success" "==================================="
-echo -e "${YELLOW}Shadowsocks Link:${NC} ${ss_link}"
+echo -e "${YELLOW}Shadowsocks Link (không có plugin):${NC} ${ss_link}"
+echo -e "${YELLOW}Shadowsocks Link (với plugin obfs để ẩn danh tốt hơn):${NC} ${ss_link_obfs}"
 log "success" "==================================="
-echo -e "${YELLOW}Shadowsocks QR Code:${NC}"
+echo -e "${YELLOW}Shadowsocks QR Code (không có plugin):${NC}"
 
-# Tạo QR code với tên cấu hình thay vì [SUCCESS]
+# Tạo QR code với tên cấu hình
 custom_qr=$(echo -n "${ss_link}" | qrencode -t UTF8)
 echo -e "$custom_qr" | sed "s/\[SUCCESS\]/${GREEN}[${config_name}]${NC}/g"
+
+echo -e "${YELLOW}Shadowsocks QR Code (với plugin obfs):${NC}"
+custom_qr_obfs=$(echo -n "${ss_link_obfs}" | qrencode -t UTF8)
+echo -e "$custom_qr_obfs" | sed "s/\[SUCCESS\]/${GREEN}[${config_name}-obfs]${NC}/g"
 
 # Hiển thị dòng phân cách có tên người dùng thay vì SUCCESS
 echo -e "${GREEN}==== ${config_name} =============================${NC}"
@@ -372,7 +449,9 @@ else
 fi
 
 # Hiển thị trạng thái tối ưu hóa
-log "info" "=== Trạng thái tối ưu hóa ==="
+log "info" "=== Trạng thái tối ưu hóa và ẩn danh ==="
+log "success" "Sử dụng port HTTPS (443): $([ $server_port -eq 443 ] && echo "Có" || echo "Không (sử dụng port $server_port)")"
+log "success" "Plugin obfs ngụy trang lưu lượng: Đã cấu hình"
 log "success" "BBR congestion control: $(sysctl net.ipv4.tcp_congestion_control | grep -q bbr && echo "Bật" || echo "Tắt")"
 log "success" "Tối ưu hóa kernel: Đã áp dụng"
 log "success" "Giám sát Monit: Đã cấu hình"
@@ -387,15 +466,18 @@ Password: ${password}
 Method: ${method}
 Remarks: ${config_name}
 
-Shadowsocks Link: ${ss_link}
+Shadowsocks Link (thông thường): ${ss_link}
+Shadowsocks Link (với obfs): ${ss_link_obfs}
 
-=== THÔNG TIN TỐI ƯU HÓA ===
+=== THÔNG TIN TỐI ƯU HÓA VÀ ẨN DANH ===
+Port HTTPS (443): $([ $server_port -eq 443 ] && echo "Sử dụng" || echo "Không (sử dụng port $server_port)")
+Plugin obfs: Đã cấu hình
 BBR: $(sysctl net.ipv4.tcp_congestion_control | grep -q bbr && echo "Bật" || echo "Tắt")
 Tối ưu kernel: Đã áp dụng
 Giám sát: Monit + Cronjob (5 phút)
 EOF
 
-log "success" "Thông tin kết nối và tối ưu hóa đã được lưu vào file shadowsocks_info.txt"
+log "success" "Thông tin kết nối, tối ưu hóa và ẩn danh đã được lưu vào file shadowsocks_info.txt"
 
 # Hướng dẫn khắc phục sự cố
 echo -e "${YELLOW}"
@@ -410,6 +492,8 @@ echo -e "${NC}"
 
 log "success" "Cài đặt hoàn tất! Shadowsocks của bạn đã được:"
 echo -e "  ${GREEN}- Cài đặt với cấu hình tối ưu${NC}"
+echo -e "  ${GREEN}- Sử dụng port 443 (HTTPS) để ngụy trang lưu lượng tốt hơn${NC}"
+echo -e "  ${GREEN}- Cấu hình với plugin obfs để ẩn danh tối đa${NC}"
 echo -e "  ${GREEN}- Tạo URI đúng định dạng với TÊN đã đảm bảo${NC}"
 echo -e "  ${GREEN}- Tăng hiệu suất với BBR và các tham số kernel tối ưu${NC}"
 echo -e "  ${GREEN}- Được bảo vệ bằng hệ thống giám sát ba lớp${NC}"
