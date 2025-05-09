@@ -1,6 +1,7 @@
 #!/bin/bash
-# Script tự động cài đặt Shadowsocks với port 443 (HTTPS) và obfs plugin sử dụng bing.cn
-# Sử dụng: chmod +x optimized_ss_installer_443.sh && sudo ./optimized_ss_installer_443.sh
+# Script tự động cài đặt Shadowsocks với Cloak plugin và DNS server trên VPS
+# Sử dụng: chmod +x shadowsocks_cloak_dns_installer.sh && sudo ./shadowsocks_cloak_dns_installer.sh
+# Cập nhật: 2025-05-09 - Thêm chức năng DNS server
 
 # Màu sắc
 RED='\033[0;31m'
@@ -14,6 +15,10 @@ if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}Vui lòng chạy script với quyền sudo!${NC}"
   exit 1
 fi
+
+# Lấy thông tin thời gian
+CURRENT_DATE=$(date "+%Y-%m-%d")
+CURRENT_USER="mun0602"
 
 # Hỏi tên cho cấu hình ngay từ đầu
 while true; do
@@ -46,9 +51,9 @@ log() {
 
 # Xóa cài đặt cũ nếu có
 log "info" "Kiểm tra và xóa cài đặt cũ nếu tồn tại..."
-systemctl stop shadowsocks-libev ss-server 2>/dev/null
-systemctl disable shadowsocks-libev ss-server 2>/dev/null
-rm -f /etc/systemd/system/ss-server.service 2>/dev/null
+systemctl stop shadowsocks-libev ss-server cloak-server unbound 2>/dev/null
+systemctl disable shadowsocks-libev ss-server cloak-server unbound 2>/dev/null
+rm -f /etc/systemd/system/ss-server.service /etc/systemd/system/cloak-server.service 2>/dev/null
 systemctl daemon-reload
 
 # Cập nhật repository
@@ -57,7 +62,7 @@ apt-get update -y
 
 # Cài đặt các gói cần thiết
 log "info" "Đang cài đặt các gói cần thiết..."
-apt-get install -y curl wget jq qrencode unzip iptables shadowsocks-libev monit lsof git automake
+apt-get install -y curl wget jq qrencode unzip iptables shadowsocks-libev monit lsof git golang unbound bc
 
 # Sử dụng port 443 (HTTPS) để ẩn danh tốt hơn
 server_port=443
@@ -94,10 +99,16 @@ if lsof -i :443 > /dev/null 2>&1; then
         fi
     fi
 else
-    log "success" "Port 443 khả dụng và sẽ được sử dụng cho Shadowsocks."
+    log "success" "Port 443 khả dụng và sẽ được sử dụng cho Shadowsocks với Cloak."
 fi
 
-log "success" "Đã cấu hình port: ${server_port}" 
+log "success" "Đã cấu hình port: ${server_port}"
+
+# Chọn port Shadowsocks nội bộ (khác với port công khai)
+ss_port=$(shuf -i 10000-60000 -n 1)
+
+# Chọn port DNS (53 là mặc định)
+dns_port=53
 
 # Tạo mật khẩu ngẫu nhiên mạnh (16 ký tự với cả chữ, số, ký tự đặc biệt)
 password=$(tr -dc 'A-Za-z0-9!@#$%^&*()_+' </dev/urandom | head -c 16)
@@ -136,128 +147,202 @@ fi
 
 log "success" "Địa chỉ IP của server: ${server_ip}"
 
-# Cài đặt simple-obfs từ kho lưu trữ nếu có
-log "info" "Đang cài đặt simple-obfs..."
+# Cài đặt và cấu hình DNS server (Unbound)
+log "info" "Đang cài đặt và cấu hình DNS server (Unbound)..."
 
-# Thử cài đặt từ kho lưu trữ trước
-apt-get install -y simple-obfs 2>/dev/null || true
+# Tạo thư mục cấu hình nếu cần
+mkdir -p /var/lib/unbound/
 
-# Kiểm tra nếu simple-obfs đã được cài đặt
-if ! command -v obfs-server > /dev/null; then
-  log "info" "simple-obfs không có trong kho lưu trữ. Đang cài đặt từ nguồn..."
-  
-  # Cài đặt các gói cần thiết
-  apt-get install -y --no-install-recommends build-essential autoconf libtool libssl-dev libpcre3-dev libev-dev asciidoc xmlto automake
+# Tải root hints
+wget -O /var/lib/unbound/root.hints https://www.internic.net/domain/named.root
+chmod 644 /var/lib/unbound/root.hints
 
-  # Clone repository
-  cd /tmp
-  rm -rf simple-obfs
-  git clone https://github.com/shadowsocks/simple-obfs.git
-  cd simple-obfs
-  git submodule update --init --recursive
-  
-  # Biên dịch và cài đặt
-  ./autogen.sh
-  ./configure
-  make
-  make install
-  
-  cd ..
-  rm -rf simple-obfs
-  
-  # Kiểm tra lại
-  if command -v obfs-server > /dev/null; then
-    log "success" "Đã cài đặt simple-obfs thành công."
-  else
-    log "error" "Không thể cài đặt simple-obfs. Tiếp tục mà không có plugin..."
-    use_plugin=false
-  fi
-else
-  log "success" "simple-obfs đã được cài đặt."
-  use_plugin=true
-fi
-
-# Cấu hình Shadowsocks
-log "info" "Đang cấu hình Shadowsocks..."
-
-# Kiểm tra nếu có thể sử dụng plugin
-if [ "$use_plugin" = true ] && command -v obfs-server > /dev/null; then
-  log "info" "Đang cấu hình Shadowsocks với plugin obfs..."
-  cat > /etc/shadowsocks-libev/config.json << EOF
-{
-    "server":"0.0.0.0",
-    "server_port":${server_port},
-    "password":"${password}",
-    "timeout":300,
-    "method":"${method}",
-    "fast_open":true,
-    "no_delay":true,
-    "reuse_port":true,
-    "nameserver":"8.8.8.8,1.1.1.1",
-    "mode":"tcp_and_udp",
-    "plugin":"obfs-server",
-    "plugin_opts":"obfs=tls"
-}
+# Tạo file cấu hình unbound
+cat > /etc/unbound/unbound.conf << EOF
+server:
+    # Các cấu hình cơ bản
+    verbosity: 1
+    interface: 0.0.0.0
+    port: ${dns_port}
+    do-ip4: yes
+    do-ip6: yes
+    do-udp: yes
+    do-tcp: yes
+    
+    # Bảo mật
+    access-control: 0.0.0.0/0 allow
+    root-hints: "/var/lib/unbound/root.hints"
+    hide-identity: yes
+    hide-version: yes
+    
+    # Tối ưu hóa
+    prefetch: yes
+    prefetch-key: yes
+    minimal-responses: yes
+    serve-expired: yes
+    
+    # Cache
+    cache-min-ttl: 60
+    cache-max-ttl: 86400
+    rrset-roundrobin: yes
+    
+    # Giới hạn tài nguyên
+    so-rcvbuf: 4m
+    msg-cache-size: 64m
+    rrset-cache-size: 128m
+    
+    # Các tùy chọn khác
+    do-not-query-localhost: no
+    
+# Chuyển tiếp đến DNS servers công cộng
+forward-zone:
+    name: "."
+    forward-addr: 1.1.1.1@53       # Cloudflare
+    forward-addr: 8.8.8.8@53       # Google
+    forward-addr: 9.9.9.9@53       # Quad9
 EOF
-else
-  log "warning" "Đang cấu hình Shadowsocks không có plugin..."
-  cat > /etc/shadowsocks-libev/config.json << EOF
-{
-    "server":"0.0.0.0",
-    "server_port":${server_port},
-    "password":"${password}",
-    "timeout":300,
-    "method":"${method}",
-    "fast_open":true,
-    "no_delay":true,
-    "reuse_port":true,
-    "nameserver":"8.8.8.8,1.1.1.1",
-    "mode":"tcp_and_udp"
-}
-EOF
-  use_plugin=false
-fi
 
-# Mở port trên tường lửa
-log "info" "Đang cấu hình tường lửa..."
+# Mở port DNS
+log "info" "Mở port DNS (53) trên tường lửa..."
 # UFW
 if command -v ufw &> /dev/null; then
-    ufw allow $server_port/tcp
-    ufw allow $server_port/udp
-    log "success" "Đã mở port ${server_port} trên UFW."
+    ufw allow ${dns_port}/tcp
+    ufw allow ${dns_port}/udp
+    log "success" "Đã mở port ${dns_port} (DNS) trên UFW."
 fi
 
 # Iptables
-iptables -I INPUT -p tcp --dport $server_port -j ACCEPT
-iptables -I INPUT -p udp --dport $server_port -j ACCEPT
-# Lưu quy tắc iptables để tồn tại sau khi khởi động lại
-if command -v iptables-save &> /dev/null; then
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules 2>/dev/null
-fi
-log "success" "Đã mở port ${server_port} trên iptables."
+iptables -I INPUT -p tcp --dport ${dns_port} -j ACCEPT
+iptables -I INPUT -p udp --dport ${dns_port} -j ACCEPT
 
-# Khởi động lại dịch vụ shadowsocks-libev
-log "info" "Đang khởi động dịch vụ Shadowsocks..."
-systemctl restart shadowsocks-libev
-systemctl enable shadowsocks-libev
+# Khởi động Unbound
+systemctl restart unbound
+systemctl enable unbound
+
+# Kiểm tra Unbound đã hoạt động chưa
 sleep 2
-
-# Kiểm tra trạng thái dịch vụ
-if systemctl is-active --quiet shadowsocks-libev; then
-    log "success" "Dịch vụ Shadowsocks đã được khởi động thành công."
-    service_name="shadowsocks-libev"
-else
-    log "warning" "Dịch vụ Shadowsocks không khởi động được. Đang thử phương pháp thay thế..."
+if systemctl is-active --quiet unbound; then
+    log "success" "DNS server (Unbound) đã được khởi động thành công trên port ${dns_port}."
     
-    # Thử cài đặt và cấu hình lại bằng ss-server trực tiếp
-    log "info" "Đang cấu hình ss-server trực tiếp..."
-    cat > /etc/systemd/system/ss-server.service << EOF
+    # Kiểm tra DNS hoạt động
+    if dig @127.0.0.1 -p ${dns_port} google.com +short > /dev/null 2>&1; then
+        log "success" "DNS server hoạt động tốt và có thể phân giải tên miền."
+    else
+        log "warning" "DNS server đã khởi động nhưng dường như không thể phân giải tên miền."
+    fi
+else
+    log "error" "DNS server (Unbound) không thể khởi động. Vui lòng kiểm tra logs: journalctl -u unbound"
+fi
+
+# Cài đặt Cloak
+log "info" "Đang cài đặt Cloak để thay thế plugin obfs..."
+
+# Tạo thư mục để cài đặt Cloak
+mkdir -p /opt/cloak
+cd /opt/cloak
+
+# Kiểm tra phiên bản Go
+go_version=$(go version 2>/dev/null | grep -oP "go\d+\.\d+" | grep -oP "\d+\.\d+")
+if [ -z "$go_version" ] || [ "$(echo "$go_version < 1.14" | bc -l)" -eq 1 ]; then
+  log "warning" "Phiên bản Go không đủ hoặc không được cài đặt. Đang tải phiên bản mới nhất của Cloak..."
+  
+  # Tải phiên bản binary mới nhất của Cloak
+  latest_release=$(curl -s https://api.github.com/repos/cbeuw/Cloak/releases/latest | grep "tag_name" | cut -d'"' -f4)
+  arch=$(uname -m)
+  
+  if [ "$arch" = "x86_64" ]; then
+    download_url="https://github.com/cbeuw/Cloak/releases/download/$latest_release/ck-server-linux-amd64-$latest_release"
+    curl -L -o ck-server "$download_url"
+  elif [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
+    download_url="https://github.com/cbeuw/Cloak/releases/download/$latest_release/ck-server-linux-arm64-$latest_release"
+    curl -L -o ck-server "$download_url"
+  else
+    log "error" "Không hỗ trợ kiến trúc $arch. Vui lòng cài đặt Cloak thủ công."
+    exit 1
+  fi
+else
+  log "info" "Go đã được cài đặt, đang tải và biên dịch Cloak từ nguồn..."
+  
+  # Clone Cloak repo
+  git clone https://github.com/cbeuw/Cloak.git
+  cd Cloak
+  
+  # Build Cloak
+  go build -o ck-server ./cmd/ck-server
+  cp ck-server ../.
+  cd ..
+  rm -rf Cloak
+fi
+
+chmod +x ck-server
+mv ck-server /usr/local/bin/
+
+# Tạo UID và secret keys cho Cloak
+log "info" "Đang tạo các khóa cho Cloak..."
+# Di chuyển đến thư mục làm việc
+cd /opt/cloak
+
+# Tạo khóa công khai và khóa bí mật cho Cloak
+ck_private_key=$(openssl ecparam -genkey -name prime256v1 | openssl ec -out /dev/stdout -noout)
+ck_public_key=$(echo "$ck_private_key" | openssl ec -pubout -outform PEM | tail -n +2 | head -n -1 | tr -d '\n')
+
+# Tạo UID và mật khẩu cho Cloak client
+ck_uid=$(cat /proc/sys/kernel/random/uuid)
+ck_client_password=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+
+# Tạo file cấu hình cho Cloak server
+log "info" "Đang cấu hình Cloak..."
+cat > /opt/cloak/ck-server.json << EOF
+{
+  "ProxyBook": {
+    "shadowsocks": [
+      "tcp",
+      "127.0.0.1:${ss_port}"
+    ]
+  },
+  "BindAddr": [
+    ":${server_port}"
+  ],
+  "BypassUID": [],
+  "RedirAddr": "bing.cn",
+  "PrivateKey": "${ck_private_key//\\/\\\\}",
+  "AdminUID": "${ck_uid}",
+  "DatabasePath": "/opt/cloak/userinfo.db",
+  "StreamTimeout": 300
+}
+EOF
+
+# Sử dụng ck-server để thêm người dùng
+/usr/local/bin/ck-server -c /opt/cloak/ck-server.json -u ${ck_uid} -k ${ck_client_password}
+
+# Tạo file cấu hình Shadowsocks
+log "info" "Đang cấu hình Shadowsocks để làm việc với Cloak..."
+cat > /etc/shadowsocks-libev/config.json << EOF
+{
+    "server":"127.0.0.1",
+    "server_port":${ss_port},
+    "password":"${password}",
+    "timeout":300,
+    "method":"${method}",
+    "fast_open":true,
+    "no_delay":true,
+    "reuse_port":true,
+    "nameserver":"127.0.0.1",
+    "mode":"tcp_and_udp"
+}
+EOF
+
+# Tạo systemd service cho Cloak
+log "info" "Đang tạo service cho Cloak..."
+cat > /etc/systemd/system/cloak-server.service << EOF
 [Unit]
-Description=Shadowsocks Server
+Description=Cloak Server Service
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/ss-server -c /etc/shadowsocks-libev/config.json -u
+Type=simple
+User=nobody
+ExecStart=/usr/local/bin/ck-server -c /opt/cloak/ck-server.json
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1000000
@@ -266,18 +351,40 @@ LimitNOFILE=1000000
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl start ss-server
-    systemctl enable ss-server
-    sleep 2
-    
-    if systemctl is-active --quiet ss-server; then
-        log "success" "Dịch vụ ss-server đã được khởi động thành công."
-        service_name="ss-server"
-    else
-        log "error" "Tất cả các phương pháp đều thất bại. Vui lòng kiểm tra logs để biết thêm chi tiết: journalctl -xe"
-        exit 1
-    fi
+# Mở port trên tường lửa
+log "info" "Đang cấu hình tường lửa..."
+# UFW
+if command -v ufw &> /dev/null; then
+    ufw allow $server_port/tcp
+    log "success" "Đã mở port ${server_port} trên UFW."
+fi
+
+# Iptables
+iptables -I INPUT -p tcp --dport $server_port -j ACCEPT
+# Lưu quy tắc iptables để tồn tại sau khi khởi động lại
+if command -v iptables-save &> /dev/null; then
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules 2>/dev/null
+fi
+log "success" "Đã mở port ${server_port} trên iptables."
+
+# Khởi động dịch vụ Cloak và Shadowsocks
+log "info" "Đang khởi động các dịch vụ..."
+systemctl daemon-reload
+systemctl start cloak-server
+systemctl enable cloak-server
+sleep 2
+
+systemctl restart shadowsocks-libev
+systemctl enable shadowsocks-libev
+sleep 2
+
+# Kiểm tra trạng thái dịch vụ
+if systemctl is-active --quiet cloak-server && systemctl is-active --quiet shadowsocks-libev; then
+    log "success" "Cả Cloak và Shadowsocks đã được khởi động thành công."
+else
+    log "error" "Có lỗi khi khởi động dịch vụ. Vui lòng kiểm tra logs để biết thêm chi tiết:"
+    echo "journalctl -u cloak-server -n 50"
+    echo "journalctl -u shadowsocks-libev -n 50"
 fi
 
 log "info" "=== BẮT ĐẦU TỐI ƯU HIỆU SUẤT VÀ CÀI ĐẶT GIÁM SÁT ==="
@@ -355,26 +462,51 @@ sysctl -p
 log "success" "Đã tối ưu hóa tham số kernel thành công!"
 
 # 3. Cài đặt và cấu hình giám sát với Monit
-log "info" "Đang cấu hình Monit để giám sát Shadowsocks..."
+log "info" "Đang cấu hình Monit để giám sát các dịch vụ..."
 
-# Tạo file cấu hình Monit cho Shadowsocks
+# Tạo file cấu hình Monit cho Shadowsocks và Cloak
 cat > /etc/monit/conf.d/shadowsocks << EOF
-check process $service_name with pidfile /var/run/$service_name.pid
-  start program = "/usr/bin/systemctl start $service_name"
-  stop program = "/usr/bin/systemctl stop $service_name"
-  if failed port $server_port for 3 cycles then restart
+check process shadowsocks-libev with pidfile /var/run/shadowsocks-libev.pid
+  start program = "/usr/bin/systemctl start shadowsocks-libev"
+  stop program = "/usr/bin/systemctl stop shadowsocks-libev"
+  if failed port ${ss_port} for 3 cycles then restart
   if 5 restarts within 5 cycles then timeout
-  if changed pid then alert
+EOF
+
+cat > /etc/monit/conf.d/cloak << EOF
+check process cloak-server with pidfile /var/run/cloak-server.pid
+  start program = "/usr/bin/systemctl start cloak-server"
+  stop program = "/usr/bin/systemctl stop cloak-server"
+  if failed port ${server_port} for 3 cycles then restart
+  if 5 restarts within 5 cycles then timeout
+EOF
+
+cat > /etc/monit/conf.d/unbound << EOF
+check process unbound with pidfile /var/run/unbound/unbound.pid
+  start program = "/usr/bin/systemctl start unbound"
+  stop program = "/usr/bin/systemctl stop unbound"
+  if failed port ${dns_port} for 3 cycles then restart
+  if 5 restarts within 5 cycles then timeout
 EOF
 
 # Nếu file PID không tồn tại, thử cách khác
-if [ ! -f "/var/run/$service_name.pid" ]; then
+if [ ! -f "/var/run/cloak-server.pid" ]; then
   log "warning" "File PID không tồn tại, sử dụng phương pháp thay thế..."
-  cat > /etc/monit/conf.d/shadowsocks << EOF
-check process $service_name matching "ss-server|ss-local|ss-redir|ss-tunnel"
-  start program = "/usr/bin/systemctl start $service_name"
-  stop program = "/usr/bin/systemctl stop $service_name"
-  if failed port $server_port for 3 cycles then restart
+  cat > /etc/monit/conf.d/cloak << EOF
+check process cloak-server matching "ck-server"
+  start program = "/usr/bin/systemctl start cloak-server"
+  stop program = "/usr/bin/systemctl stop cloak-server"
+  if failed port ${server_port} for 3 cycles then restart
+  if 5 restarts within 5 cycles then timeout
+EOF
+fi
+
+if [ ! -f "/var/run/unbound/unbound.pid" ]; then
+  cat > /etc/monit/conf.d/unbound << EOF
+check process unbound matching "unbound"
+  start program = "/usr/bin/systemctl start unbound"
+  stop program = "/usr/bin/systemctl stop unbound"
+  if failed port ${dns_port} for 3 cycles then restart
   if 5 restarts within 5 cycles then timeout
 EOF
 fi
@@ -387,186 +519,195 @@ sed -i 's/allow localhost/allow localhost/g' /etc/monit/monitrc
 systemctl restart monit
 systemctl enable monit
 
-log "success" "Đã cấu hình Monit để giám sát Shadowsocks thành công!"
+log "success" "Đã cấu hình Monit để giám sát các dịch vụ thành công!"
 log "success" "Monit sẽ tự động khởi động lại dịch vụ nếu nó không phản hồi."
 
 # 4. Tạo script để kiểm tra và khởi động lại dịch vụ (hữu ích cho cronjob)
-cat > /usr/local/bin/check_shadowsocks.sh << EOF
+cat > /usr/local/bin/check_services.sh << EOF
 #!/bin/bash
-# Script kiểm tra và khởi động lại Shadowsocks nếu cần
+# Script kiểm tra và khởi động lại các dịch vụ nếu cần
 
 # Kiểm tra xem dịch vụ có đang chạy không
-if ! systemctl is-active --quiet $service_name; then
-  systemctl restart $service_name
-  echo "[\$(date)] Đã khởi động lại $service_name" >> /var/log/shadowsocks_monitor.log
+if ! systemctl is-active --quiet shadowsocks-libev; then
+  systemctl restart shadowsocks-libev
+  echo "[\$(date)] Đã khởi động lại shadowsocks-libev" >> /var/log/services_monitor.log
+fi
+
+if ! systemctl is-active --quiet cloak-server; then
+  systemctl restart cloak-server
+  echo "[\$(date)] Đã khởi động lại cloak-server" >> /var/log/services_monitor.log
+fi
+
+if ! systemctl is-active --quiet unbound; then
+  systemctl restart unbound
+  echo "[\$(date)] Đã khởi động lại unbound" >> /var/log/services_monitor.log
 fi
 
 # Kiểm tra xem port có đang lắng nghe không
-if ! ss -tuln | grep -q ":$server_port "; then
-  systemctl restart $service_name
-  echo "[\$(date)] Đã khởi động lại $service_name vì port $server_port không hoạt động" >> /var/log/shadowsocks_monitor.log
+if ! ss -tuln | grep -q ":${server_port} "; then
+  systemctl restart cloak-server
+  echo "[\$(date)] Đã khởi động lại cloak-server vì port ${server_port} không hoạt động" >> /var/log/services_monitor.log
+fi
+
+if ! ss -tuln | grep -q ":${dns_port} "; then
+  systemctl restart unbound
+  echo "[\$(date)] Đã khởi động lại unbound vì port ${dns_port} không hoạt động" >> /var/log/services_monitor.log
 fi
 
 # Kiểm tra kết nối internet
 if ! ping -c 1 8.8.8.8 >/dev/null 2>&1; then
-  echo "[\$(date)] Mất kết nối internet" >> /var/log/shadowsocks_monitor.log
+  echo "[\$(date)] Mất kết nối internet" >> /var/log/services_monitor.log
   # Thử khởi động lại dịch vụ mạng
   systemctl restart networking
   systemctl restart NetworkManager 2>/dev/null
 fi
 EOF
 
-chmod +x /usr/local/bin/check_shadowsocks.sh
+chmod +x /usr/local/bin/check_services.sh
 
 # Thêm cronjob để chạy script kiểm tra mỗi 5 phút
-(crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/check_shadowsocks.sh") | crontab -
+(crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/check_services.sh") | crontab -
 
-log "success" "Đã tạo script kiểm tra và cronjob để giám sát Shadowsocks mỗi 5 phút!"
+log "success" "Đã tạo script kiểm tra và cronjob để giám sát các dịch vụ mỗi 5 phút!"
 
-# Tạo URI đúng định dạng
-# Chuỗi để mã hóa: method:password
-auth_string="${method}:${password}"
-# Mã hóa base64 (không xuống dòng)
-auth_base64=$(echo -n "${auth_string}" | base64 -w 0)
+# Tạo cấu hình client cho Cloak
+cloak_client_config=$(cat <<EOF
+{
+  "Transport": "direct",
+  "ProxyMethod": "shadowsocks",
+  "EncryptionMethod": "plain",
+  "UID": "${ck_uid}",
+  "PublicKey": "${ck_public_key}",
+  "ServerName": "bing.cn",
+  "ServerAddress": "${server_ip}:${server_port}",
+  "NumConn": 4,
+  "BrowserSig": "chrome",
+  "StreamTimeout": 300
+}
+EOF
+)
 
-# Tạo URI Shadowsocks thông thường
-ss_link="ss://${auth_base64}@${server_ip}:${server_port}"
-
-# Tạo URI với plugin obfs nếu được sử dụng
-if [ "$use_plugin" = true ]; then
-  # Sử dụng bing.cn thay vì Google (theo yêu cầu của người dùng)
-  ss_link_obfs="ss://${auth_base64}@${server_ip}:${server_port}/?plugin=obfs-local%3Bobfs%3Dtls%3Bobfs-host%3Dbing.cn"
-fi
-
-# ĐẢM BẢO có phần tên trong URI
-if [ -n "$config_name" ]; then
-  ss_link="${ss_link}#${config_name}"
-  if [ "$use_plugin" = true ]; then
-    ss_link_obfs="${ss_link_obfs}#${config_name}-obfs"
-  fi
-else
-  # Nếu không có tên, tạo tên mặc định từ thông tin server
-  config_name="SS-${server_ip}-$(date +%Y%m%d)"
-  ss_link="${ss_link}#${config_name}"
-  if [ "$use_plugin" = true ]; then
-    ss_link_obfs="${ss_link_obfs}#${config_name}-obfs"
-  fi
-fi
+# Base64 encode config Cloak client
+cloak_client_config_b64=$(echo "$cloak_client_config" | base64 -w 0)
 
 # In thông tin
 log "success" "==================================="
 log "success" "Cài đặt, tối ưu và giám sát hoàn tất!"
 log "success" "==================================="
-echo -e "${YELLOW}Thông tin kết nối Shadowsocks:${NC}"
+echo -e "${YELLOW}Thông tin kết nối Shadowsocks + Cloak:${NC}"
 echo -e "Server IP: ${server_ip}"
 echo -e "Server Port: ${server_port} ${GREEN}(Port HTTPS chuẩn để ẩn danh tốt hơn)${NC}"
-echo -e "Password: ${password}"
-echo -e "Method: ${method}"
+echo -e "Shadowsocks Password: ${password}"
+echo -e "Shadowsocks Method: ${method}"
+echo -e "Cloak UID: ${ck_uid}"
+echo -e "Cloak Password: ${ck_client_password}"
+echo -e "Cloak Public Key: ${ck_public_key}"
 echo -e "Tên cấu hình: ${config_name}"
-if [ "$use_plugin" = true ]; then
-  echo -e "Plugin: obfs-local với obfs=tls; obfs-host=bing.cn"
-else
-  echo -e "Plugin: Không sử dụng (cài đặt không thành công)"
-fi
 log "success" "==================================="
-echo -e "${YELLOW}Shadowsocks Link (không có plugin):${NC} ${ss_link}"
-if [ "$use_plugin" = true ]; then
-  echo -e "${YELLOW}Shadowsocks Link (với plugin obfs để ẩn danh tốt hơn):${NC} ${ss_link_obfs}"
-fi
+echo -e "${YELLOW}Thông tin DNS server:${NC}"
+echo -e "DNS Server IP: ${server_ip}"
+echo -e "DNS Server Port: ${dns_port}"
+echo -e "Để sử dụng DNS này, hãy cấu hình DNS trong thiết bị của bạn với IP: ${server_ip}"
+echo -e "${GREEN}Cách kiểm tra DNS server:${NC} nslookup google.com ${server_ip}"
 log "success" "==================================="
-echo -e "${YELLOW}Shadowsocks QR Code (không có plugin):${NC}"
+echo -e "${YELLOW}HƯỚNG DẪN CẤU HÌNH CLOAK CLIENT:${NC}"
+echo -e "1. Cài đặt plugin Cloak (ck-client) trên máy khách"
+echo -e "2. Cấu hình Shadowsocks client như sau:"
+echo -e "   Server: 127.0.0.1"
+echo -e "   Port: 1080 (hoặc port do bạn chọn)"
+echo -e "   Password: ${password}"
+echo -e "   Method: ${method}"
+echo -e "   Plugin: ck-client"
+echo -e "   Plugin Config: ${cloak_client_config_b64}"
+log "success" "==================================="
+echo -e "${YELLOW}HOẶC TẢI FILE CẤU HÌNH CLOAK CLIENT:${NC}"
 
-# Tạo QR code với tên cấu hình
-custom_qr=$(echo -n "${ss_link}" | qrencode -t UTF8)
-echo -e "$custom_qr" | sed "s/\[SUCCESS\]/${GREEN}[${config_name}]${NC}/g"
+# Lưu cấu hình Cloak client vào file
+cat > /opt/cloak/ck-client.json << EOF
+${cloak_client_config}
+EOF
 
-if [ "$use_plugin" = true ]; then
-  echo -e "${YELLOW}Shadowsocks QR Code (với plugin obfs):${NC}"
-  custom_qr_obfs=$(echo -n "${ss_link_obfs}" | qrencode -t UTF8)
-  echo -e "$custom_qr_obfs" | sed "s/\[SUCCESS\]/${GREEN}[${config_name}-obfs]${NC}/g"
-fi
-
-# Hiển thị dòng phân cách có tên người dùng thay vì SUCCESS
-echo -e "${GREEN}==== ${config_name} =============================${NC}"
-
-# Kiểm tra kết nối
-log "info" "Đang kiểm tra kết nối..."
-if ss -tuln | grep -q ":$server_port "; then
-    log "success" "Cổng ${server_port} đang mở và lắng nghe kết nối."
-else
-    log "error" "Cổng ${server_port} không mở. Vui lòng kiểm tra cấu hình tường lửa."
-fi
-
-# Hiển thị trạng thái tối ưu hóa
-log "info" "=== Trạng thái tối ưu hóa và ẩn danh ==="
-log "success" "Sử dụng port HTTPS (443): $([ $server_port -eq 443 ] && echo "Có" || echo "Không (sử dụng port $server_port)")"
-if [ "$use_plugin" = true ]; then
-  log "success" "Plugin obfs ngụy trang lưu lượng: Đã cấu hình với obfs-host=bing.cn"
-else
-  log "warning" "Plugin obfs ngụy trang lưu lượng: Không được cài đặt"
-fi
-log "success" "BBR congestion control: $(sysctl net.ipv4.tcp_congestion_control | grep -q bbr && echo "Bật" || echo "Tắt")"
-log "success" "Tối ưu hóa kernel: Đã áp dụng"
-log "success" "Giám sát Monit: Đã cấu hình"
-log "success" "Cronjob kiểm tra: Mỗi 5 phút"
+echo -e "Cấu hình Cloak client đã được lưu vào file: /opt/cloak/ck-client.json"
+log "success" "==================================="
 
 # Lưu thông tin vào file
-cat > shadowsocks_info.txt << EOF
-=== THÔNG TIN KẾT NỐI SHADOWSOCKS (Cập nhật: $(date "+%Y-%m-%d %H:%M:%S")) ===
-Server: ${server_ip}
-Port: ${server_port}
-Password: ${password}
-Method: ${method}
-Remarks: ${config_name}
+cat > shadowsocks_cloak_dns_info.txt << EOF
+=== THÔNG TIN KẾT NỐI SHADOWSOCKS + CLOAK + DNS (Cập nhật: ${CURRENT_DATE}) ===
+Server IP: ${server_ip}
+Server Port: ${server_port}
+Shadowsocks:
+  - Password: ${password}
+  - Method: ${method}
+  - Local Port: ${ss_port}
 
-Shadowsocks Link (thông thường): ${ss_link}
-EOF
+Cloak:
+  - UID: ${ck_uid}
+  - Password: ${ck_client_password}
+  - Public Key: ${ck_public_key}
+  - Redirect Site: bing.cn
 
-if [ "$use_plugin" = true ]; then
-  cat >> shadowsocks_info.txt << EOF
-Shadowsocks Link (với obfs): ${ss_link_obfs}
+DNS Server:
+  - IP: ${server_ip}
+  - Port: ${dns_port}
+  - Test command: nslookup google.com ${server_ip}
+
+=== THÔNG TIN CẤU HÌNH CLOAK CLIENT ===
+{
+  "Transport": "direct",
+  "ProxyMethod": "shadowsocks",
+  "EncryptionMethod": "plain",
+  "UID": "${ck_uid}",
+  "PublicKey": "${ck_public_key}",
+  "ServerName": "bing.cn",
+  "ServerAddress": "${server_ip}:${server_port}",
+  "NumConn": 4,
+  "BrowserSig": "chrome",
+  "StreamTimeout": 300
+}
+
+Base64 encoded config for plugin parameter: ${cloak_client_config_b64}
 
 === THÔNG TIN TỐI ƯU HÓA VÀ ẨN DANH ===
 Port HTTPS (443): $([ $server_port -eq 443 ] && echo "Sử dụng" || echo "Không (sử dụng port $server_port)")
-Plugin obfs: Đã cấu hình với obfs-host=bing.cn
-EOF
-else
-  cat >> shadowsocks_info.txt << EOF
-
-=== THÔNG TIN TỐI ƯU HÓA VÀ ẨN DANH ===
-Port HTTPS (443): $([ $server_port -eq 443 ] && echo "Sử dụng" || echo "Không (sử dụng port $server_port)")
-Plugin obfs: Không được cài đặt
-EOF
-fi
-
-cat >> shadowsocks_info.txt << EOF
+Cloak Plugin: Đã cài đặt và cấu hình
+DNS Server: Đã cài đặt trên ${server_ip}:${dns_port}
 BBR: $(sysctl net.ipv4.tcp_congestion_control | grep -q bbr && echo "Bật" || echo "Tắt")
 Tối ưu kernel: Đã áp dụng
 Giám sát: Monit + Cronjob (5 phút)
 
-Được tạo bởi: ${USER} vào $(date "+%Y-%m-%d %H:%M:%S")
+Được tạo bởi: ${CURRENT_USER} vào ${CURRENT_DATE}
 EOF
 
-log "success" "Thông tin kết nối, tối ưu hóa và ẩn danh đã được lưu vào file shadowsocks_info.txt"
+log "success" "Thông tin kết nối, tối ưu hóa và ẩn danh đã được lưu vào file shadowsocks_cloak_dns_info.txt"
 
 # Hướng dẫn khắc phục sự cố
 echo -e "${YELLOW}"
 echo "HƯỚNG DẪN KHẮC PHỤC SỰ CỐ:"
-echo "1. Kiểm tra log: sudo journalctl -u $service_name -f"
-echo "2. Kiểm tra cổng đã mở: sudo lsof -i :$server_port"
-echo "3. Kiểm tra tường lửa: sudo iptables -L | grep $server_port"
-echo "4. Khởi động lại dịch vụ: sudo systemctl restart $service_name"
+echo "1. Kiểm tra log các dịch vụ:"
+echo "   - sudo journalctl -u shadowsocks-libev -f"
+echo "   - sudo journalctl -u cloak-server -f"
+echo "   - sudo journalctl -u unbound -f"
+echo "2. Kiểm tra cổng đã mở:"
+echo "   - sudo lsof -i :$server_port (Cloak)"
+echo "   - sudo lsof -i :$dns_port (DNS)"
+echo "3. Kiểm tra tường lửa:"
+echo "   - sudo iptables -L"
+echo "4. Khởi động lại dịch vụ:"
+echo "   - sudo systemctl restart shadowsocks-libev"
+echo "   - sudo systemctl restart cloak-server" 
+echo "   - sudo systemctl restart unbound" 
 echo "5. Kiểm tra trạng thái Monit: sudo monit status"
-echo "6. Xem log giám sát: cat /var/log/shadowsocks_monitor.log"
+echo "6. Xem log giám sát: cat /var/log/services_monitor.log"
+echo "7. Kiểm tra DNS server hoạt động: nslookup google.com ${server_ip}"
 echo -e "${NC}"
 
-log "success" "Cài đặt hoàn tất! Shadowsocks của bạn đã được:"
-echo -e "  ${GREEN}- Cài đặt với cấu hình tối ưu${NC}"
+log "success" "Cài đặt hoàn tất! Hệ thống của bạn đã được:"
+echo -e "  ${GREEN}- Cài đặt Shadowsocks + Cloak với cấu hình tối ưu${NC}"
+echo -e "  ${GREEN}- Cấu hình DNS server sử dụng IP VPS của bạn${NC}"
 echo -e "  ${GREEN}- Sử dụng port 443 (HTTPS) để ngụy trang lưu lượng tốt hơn${NC}"
-if [ "$use_plugin" = true ]; then
-  echo -e "  ${GREEN}- Cấu hình với plugin obfs ngụy trang qua bing.cn để ẩn danh tối đa${NC}"
-fi
-echo -e "  ${GREEN}- Tạo URI đúng định dạng với TÊN đã đảm bảo${NC}"
+echo -e "  ${GREEN}- Cấu hình với Cloak để ẩn danh vượt trội${NC}"
+echo -e "  ${GREEN}- Ngụy trang lưu lượng thành HTTPS đến bing.cn${NC}"
+echo -e "  ${GREEN}- Có khả năng chống lại DPI (Deep Packet Inspection)${NC}"
 echo -e "  ${GREEN}- Tăng hiệu suất với BBR và các tham số kernel tối ưu${NC}"
-echo -e "  ${GREEN}- Được bảo vệ bằng hệ thống giám sát ba lớp${NC}"
+echo -e "  ${GREEN}- Được bảo vệ bằng hệ thống giám sát tự động${NC}"
 echo -e "  ${GREEN}- Tự động khởi động lại nếu gặp sự cố${NC}"
